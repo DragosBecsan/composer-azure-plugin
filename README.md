@@ -10,7 +10,7 @@ Composer Azure plugin is an attempt to use Composer with Azure DevOps artifacts,
 Composer Azure Plugin requires [Composer 2](https://getcomposer.org/) and PHP8.1 or newer. It should be installed globally.
 
 ```
-$ composer global require marvincaspar/composer-azure-plugin
+$ composer global require dragosbecsan/composer-azure-plugin
 ```
 
 You have to be logged in via
@@ -59,8 +59,8 @@ is, that you can't use constraints and set a specific version.
                 "project": "<my-project-name>",
                 "feed": "<my-feed-name>",
                 "symlink": false,
-                "packages": [
-                    "vendor-name/my-package"
+                "vendors": [
+                    "vendor-name"
                 ]
             }
         ]
