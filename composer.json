@@ -1,7 +1,7 @@
 {
-    "name": "marvincaspar/composer-azure-plugin",
+    "name": "dragosbecsan/composer-azure-plugin",
     "description": "Azure Composer plugin",
-    "version": "2.0.2",
+    "version": "1.0.0",
     "type": "composer-plugin",
     "license": "MIT",
     "autoload": {

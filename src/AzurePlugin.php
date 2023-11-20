@@ -25,6 +25,9 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
 
     protected bool $isInstall = false;
 
+    /**
+     * @var Artifact[]
+     */
     protected array $downloadedArtifacts = [];
 
     public CommandExecutor $commandExecutor;
@@ -91,8 +94,8 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
         $this->modifyComposerLock($this->shortedComposerCacheDir, $this->composerCacheDir);
 
         $azureRepositories = $this->parseRequiredPackages($this->composer);
-        $this->fetchAzurePackages($azureRepositories, $this->composer->getPackage()->getName(), true);
-        $this->addAzurePackagesAsLocalRepositories($azureRepositories);
+        $this->fetchAzurePackages($azureRepositories, $this->composer->getPackage()->getName());
+        $this->addAzurePackagesAsLocalRepositories();
     }
 
     public function modifyComposerLockPostInstall(): void
@@ -128,8 +131,13 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
             return [];
         }
 
-        foreach ($extra['azure-repositories'] as ['organization' => $organization, 'project' => $project, 'feed' => $feed, 'symlink' => $symlink, 'packages' => $packages]) {
-            $azureRepository = new AzureRepository($organization, $project, $feed, $symlink);
+        foreach ($extra['azure-repositories'] as ['organization' => $organization, 'project' => $project, 'feed' => $feed, 'symlink' => $symlink, 'vendors' => $vendors]) {
+            $azureRepository = new AzureRepository($organization, $project, $feed, $symlink, $vendors);
+
+            $packages = array_filter(
+                array_keys($requires),
+                fn(string $packageName) => $this->isPackageInVendorsConfig($packageName, $vendors)
+            );
 
             foreach ($packages as $packageName) {
                 if (array_key_exists($packageName, $requires)) {
@@ -141,6 +149,27 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
         }
 
         return $azureRepositories;
+    }
+
+    private function isPackageInVendorsConfig(string $packageName, array $vendors): bool
+    {
+        [$vendor] = explode('/', $packageName);
+
+        return in_array($vendor, $vendors);
+    }
+
+    protected function parseRequiredPackagesOnDependency(AzureRepository $azureRepository, Composer $composer): array
+    {
+        $requires = $composer->getPackage()->getRequires();
+        $packages = array_filter(
+            array_keys($requires),
+            fn(string $packageName) => $this->isPackageInVendorsConfig($packageName, $azureRepository->getVendors())
+        );
+        foreach ($packages as $packageName) {
+            $azureRepository->addArtifact($packageName, $requires[$packageName]->getPrettyConstraint());
+        }
+
+        return [$azureRepository];
     }
 
     protected function fetchAzurePackages(array $azureRepositories, string $packageName, bool $isMainDependency = true): void
@@ -171,7 +200,7 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
             /** @var Artifact $artifact */
             foreach ($artifacts as $artifact) {
                 if (!$this->alreadyDownloaded($artifact, $isMainDependency)) {
-                    $this->downloadAzureArtifact($azureRepository, $artifact, $isMainDependency);
+                    $this->downloadAzureArtifact($artifact, $isMainDependency);
                 }
             }
 
@@ -199,16 +228,19 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
         return false;
     }
 
-    protected function downloadAzureArtifact(AzureRepository $azureRepository, Artifact $artifact, bool $isMainDependency): void
+    protected function downloadAzureArtifact(Artifact $artifact, bool $isMainDependency): void
     {
         if ($artifact->getVersion()->isDevVersion()) {
             return;
         }
 
+        $azureRepository = $artifact->getAzureRepository();
+
         $artifactPath = $this->getArtifactPath($azureRepository->getOrganization(), $azureRepository->getFeed(), $artifact);
 
         // scandir > 2 because of . and .. entries
         if (is_dir($artifactPath) && count(scandir($artifactPath)) > 2) {
+            $this->updateArtifactComposerVersion($artifact, $artifactPath);
             $this->io->write('<info>Package ' . $artifact->getName() . ' already downloaded - ' . $artifactPath . '</info>');
             $downloadedArtifact = $artifact;
         } else {
@@ -222,7 +254,7 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
             $command .= ' --path ' . $artifactPath;
 
             $result = $this->commandExecutor->executeShellCmd($command);
-            $downloadedArtifact = new Artifact($artifact->getName(), new Version($result->Version));
+            $downloadedArtifact = new Artifact($artifact->getName(), new Version($result->Version), $azureRepository);
 
             // is wildcard version, than rename downloaded folder to downloaded version
             if ($artifact->getVersion()->isWildcardVersion()) {
@@ -231,6 +263,8 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
                 $this->fileHelper->copyDirectory($artifactPathOld, $artifactPath);
                 $this->fileHelper->removeDirectory($artifactPathOld);
             }
+
+            $this->updateArtifactComposerVersion($downloadedArtifact, $artifactPath);
 
             $this->io->write('<info>Package ' . $artifact->getName() . ' - ' . $result->Version . ' downloaded - ' . $artifactPath . '</info>');
         }
@@ -252,7 +286,29 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
             $this->downloadedArtifacts[] = $downloadedArtifact;
         }
 
-        $this->solveDependencies($artifactPath);
+        $this->solveDependencies($azureRepository, $artifactPath);
+    }
+
+    protected function updateArtifactComposerVersion(Artifact $artifact, string $artifactPath): void
+    {
+        $artifactComposerFile = sprintf('%s/composer.json', $artifactPath);
+        if (file_exists($artifactComposerFile)) {
+            $jsonString = file_get_contents($artifactComposerFile);
+            $jsonData = json_decode($jsonString, true);
+
+            if (!isset($jsonData['version'])) {
+                $jsonData['version'] = $artifact->getVersion()->getDownloadVersion();
+                foreach (array_keys($jsonData) as $key) {
+                    if (!empty($jsonData[$key])) {
+                        continue;
+                    }
+
+                    unset($jsonData[$key]);
+                }
+
+                file_put_contents($artifactComposerFile, json_encode($jsonData, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+            }
+        }
     }
 
     protected function getArtifactPath(string $organization, string $feed, Artifact $artifact): string
@@ -270,10 +326,11 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
     }
 
 
-    protected function solveDependencies(string $packagePath)
+    protected function solveDependencies(AzureRepository $azureRepository, string $packagePath): void
     {
         $composerForPackage = $this->getComposerForPackage($packagePath);
-        $azureRepositories = $this->parseRequiredPackages($composerForPackage);
+        $azureRepositories = $this->parseRequiredPackagesOnDependency(clone $azureRepository, $composerForPackage);
+
         $this->fetchAzurePackages($azureRepositories, $composerForPackage->getPackage()->getName(), false);
     }
 
@@ -283,22 +340,21 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
         return $factory->createComposer($this->io, implode(DIRECTORY_SEPARATOR, [$path, Factory::getComposerFile()]));
     }
 
-    protected function addAzurePackagesAsLocalRepositories(array $azureRepositories)
+    protected function addAzurePackagesAsLocalRepositories(): void
     {
-        /** @var AzureRepository $azureRepository */
-        foreach ($azureRepositories as $azureRepository) {
-
-            /** @var Artifact $artifact */
-            foreach ($this->downloadedArtifacts as $artifact) {
-                $repo = $this->composer->getRepositoryManager()->createRepository(
-                    'path',
-                    [
-                        'url' => $this->getArtifactPath($azureRepository->getOrganization(), $azureRepository->getFeed(), $artifact),
-                        'options' => ['symlink' => $azureRepository->getSymlink()],
-                    ]
-                );
-                $this->composer->getRepositoryManager()->addRepository($repo);
-            }
+        foreach ($this->downloadedArtifacts as $artifact) {
+            $repo = $this->composer->getRepositoryManager()->createRepository(
+                'path',
+                [
+                    'url' => $this->getArtifactPath(
+                        $artifact->getAzureRepository()->getOrganization(),
+                        $artifact->getAzureRepository()->getFeed(),
+                        $artifact
+                    ),
+                    'options' => ['symlink' => $artifact->getAzureRepository()->getSymlink()],
+                ]
+            );
+            $this->composer->getRepositoryManager()->addRepository($repo);
         }
 
         if (is_file('composer.lock')) {
@@ -316,8 +372,32 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
         $lockData = $locker->getLockData();
         $loader = new ArrayLoader(null, true);
         $packages = [];
+
         foreach ($lockData['packages'] as $package) {
             $packageToLock = $loader->load($package);
+
+            $packageToLock->setDistMirrors(null);
+            $packageToLock->setNotificationUrl('');
+
+            $artifact = $this->getDownloadedArtifactByName($packageToLock->getName());
+            if ($artifact instanceof Artifact) {
+                $packageToLock->setDistType('path');
+                $newDistUrl = $this->getArtifactPath(
+                    $artifact->getAzureRepository()->getOrganization(),
+                    $artifact->getAzureRepository()->getFeed(),
+                    $artifact
+                );
+                $packageToLock->setDistUrl($newDistUrl);
+                $package['dist']['url'] = $newDistUrl;
+
+                $packageToLock->setDistReference(null);
+
+                $packageToLock->setTransportOptions([
+                    'symlink' => $artifact->getAzureRepository()->getSymlink(),
+                    'relative' => false
+                ]);
+            }
+
             if ($packageToLock->getDistType() === 'path') {
                 $packageToLock->setDistUrl(str_replace($this->shortedComposerCacheDir, $this->composerCacheDir, $package['dist']['url']));
             }
@@ -347,5 +427,18 @@ class AzurePlugin implements PluginInterface, EventSubscriberInterface, Capable
             $lockData['prefer-lowest'],
             []
         );
+    }
+
+    private function getDownloadedArtifactByName(string $packageName): ?Artifact
+    {
+        foreach ($this->downloadedArtifacts as $artifact) {
+            if ($artifact->getName() !== $packageName) {
+                continue;
+            }
+
+            return $artifact;
+        }
+
+        return null;
     }
 }

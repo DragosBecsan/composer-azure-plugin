@@ -7,10 +7,10 @@ namespace MarvinCaspar\Composer;
 class Artifact
 {
     public function __construct(
-        private string  $name,
-        private Version $version,
-    )
-    {
+        private readonly string          $name,
+        private readonly Version         $version,
+        private readonly AzureRepository $azureRepository
+    ) {
     }
 
     public function getName(): string
@@ -21,5 +21,10 @@ class Artifact
     public function getVersion(): Version
     {
         return $this->version;
+    }
+
+    public function getAzureRepository(): AzureRepository
+    {
+        return $this->azureRepository;
     }
 }
